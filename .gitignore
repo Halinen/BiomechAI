@@ -1,0 +1,21 @@
+# 敏感信息
+.env
+
+# 向量数据库（体积大，可本地重建）
+chroma_db/
+
+# 知识库原文（体积大，可重新爬取）
+knowledge_base/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 虚拟环境
+venv/
+.venv/
+
+# 系统文件
+.DS_Store
+Thumbs.db
