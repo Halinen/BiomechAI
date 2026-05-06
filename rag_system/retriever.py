@@ -65,6 +65,8 @@ class Retriever:
         self._model: SentenceTransformer | None = None
         self._client: chromadb.PersistentClient | None = None
         self._llm: OpenAI | None = None
+        # 中文 query → 英文术语缓存（同一句中文每次只翻译一次）
+        self._translate_cache: dict[str, str] = {}
 
     def _ensure_loaded(self):
         """确保模型和数据库已加载（如果还没加载就加载）。"""
@@ -80,6 +82,50 @@ class Retriever:
                 api_key=__import__("os").environ.get("GROQ_API_KEY"),
                 base_url=GROQ_BASE_URL,
             )
+
+    def _translate_to_english(self, text: str) -> str:
+        """
+        把中文 query 翻译成英文医学/动作评估术语，用于检索匹配。
+
+        知识库全是英文文献，但用户输入是中文，且 embedding 模型是英文的（all-MiniLM-L6-v2）。
+        实测中文 query 的 cosine distance 都在 0.87+，全部超过 0.60 阈值被丢弃 —— 等于 RAG 失效。
+        在检索入口加翻译层后，距离落在正常区间（0.4-0.5）。
+
+        如果 text 不含 CJK 字符，直接返回原文（避免对英文 query 多调一次 LLM）。
+        """
+        if not any('一' <= c <= '鿿' for c in text):
+            return text
+
+        if text in self._translate_cache:
+            return self._translate_cache[text]
+
+        prompt = (
+            "Translate the following Chinese text into concise English using standard "
+            "medical / movement assessment / physical therapy terminology. "
+            "Keep it short (one or two sentences). Output ONLY the English translation, "
+            "no explanation, no quotes.\n\n"
+            f"Chinese: {text}\n\nEnglish:"
+        )
+        try:
+            response = self._llm.chat.completions.create(
+                model=CLAUDE_MODEL,
+                max_tokens=120,
+                temperature=0,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            translation = (response.choices[0].message.content or "").strip()
+            # 去掉模型偶尔加的引号
+            if translation.startswith(('"', "'")) and translation.endswith(('"', "'")):
+                translation = translation[1:-1].strip()
+            if not translation:
+                translation = text  # 翻译失败兜底
+        except Exception as e:
+            print(f"[Retriever] 翻译失败，使用原文：{e}")
+            translation = text
+
+        self._translate_cache[text] = translation
+        print(f"[Retriever] 翻译: '{text[:30]}...' → '{translation[:60]}...'")
+        return translation
 
     def _llm_judge(self, query: str, chunk: RetrievedChunk) -> bool:
         """
@@ -127,8 +173,12 @@ class Retriever:
         """
         self._ensure_loaded()
 
+        # 知识库全是英文文献，embedding 模型也是英文的；
+        # 中文 query 必须先翻译成英文术语，否则 cosine distance 全部 > 0.60 被过滤掉。
+        search_text = self._translate_to_english(text)
+
         # 把查询文本变成向量（和建索引时用同一个模型，才能比较）
-        query_vector = self._model.encode(text).tolist()
+        query_vector = self._model.encode(search_text).tolist()
 
         try:
             collection = self._client.get_collection(collection_name)
@@ -162,9 +212,9 @@ class Retriever:
                 # 高置信度：直接保留
                 kept.append(chunk)
             elif dist < SIMILARITY_REJECT:
-                # 边界情况：交给 LLM 判断
+                # 边界情况：交给 LLM 判断（用翻译后的英文 query，与 chunk 同语言）
                 print(f"[Retriever] LLM 判断边界 chunk (score={dist:.3f}): {chunk.source_file}")
-                if self._llm_judge(text, chunk):
+                if self._llm_judge(search_text, chunk):
                     kept.append(chunk)
             # else: score >= SIMILARITY_REJECT，直接丢弃
 

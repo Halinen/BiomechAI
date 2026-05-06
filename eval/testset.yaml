@@ -1,0 +1,120 @@
+# RAG 评估测试集
+#
+# 字段说明：
+#   id              用例标识
+#   query           用户输入的中文问题
+#   gold_layers     期望命中的层（list，可多选）
+#                   候选：控制层 / 结构层 / 输出层 / 神经敏化层
+#   gold_concepts   期望出现在检索结果和最终回答里的核心知识点（list，3-5 个）
+#   gold_red_flag   是否应该触发红旗（bool）
+#   notes           设计意图（评估失败时帮助定位）
+
+# ─── 单层各类（4 条）──────────────────────────────────────────────────
+- id: case_01_fms_squat
+  query: "我做深蹲到底膝盖会内扣，脚后跟离地，胸椎也转不动"
+  gold_layers: ["结构层"]
+  gold_concepts: ["踝关节背屈受限", "胸椎活动度", "髋关节活动度"]
+  gold_red_flag: false
+  notes: "FMS 经典：深蹲分解到踝/髋/胸椎结构限制"
+
+- id: case_02_nasm_uppercross
+  query: "长期伏案后头总是前伸，肩膀圆，做引体向上根本拉不起来"
+  gold_layers: ["输出层"]
+  gold_concepts: ["上交叉综合征", "胸大肌紧张", "深层颈屈肌抑制"]
+  gold_red_flag: false
+  notes: "NASM CES 教科书 case：上交叉综合征"
+
+- id: case_03_pri_breathing
+  query: "我吸气时只有胸口起伏，肚子完全不动，跑步两公里就上气不接下气"
+  gold_layers: ["控制层"]
+  gold_concepts: ["膈肌功能异常", "代偿性胸式呼吸", "辅助呼吸肌过度激活"]
+  gold_red_flag: false
+  notes: "PRI/呼吸重训：典型胸式呼吸代偿"
+
+- id: case_04_pain_neuro
+  query: "腰痛三年了，影像没问题，但稍微一动就全身紧绷，对疼痛特别敏感"
+  gold_layers: ["神经敏化层"]
+  gold_concepts: ["中枢敏化", "恐惧回避", "疼痛神经科学教育"]
+  gold_red_flag: false
+  notes: "中枢敏化典型表现：影像阴性 + 全身敏感"
+
+# ─── 双层组合（4 条）──────────────────────────────────────────────────
+- id: case_05_squat_compensation
+  query: "深蹲时下背会塌，胸椎转不动，平时坐着也驼背，腹肌也不会发力"
+  gold_layers: ["结构层", "输出层"]
+  gold_concepts: ["胸椎活动度", "髋关节屈曲", "核心稳定", "下交叉综合征"]
+  gold_red_flag: false
+  notes: "结构限制 + 输出代偿叠加"
+
+- id: case_06_visceral_breathing
+  query: "做过阑尾切除手术，右腹按压会触发全身紧张，呼吸时右侧肋骨扩张明显比左侧少"
+  gold_layers: ["控制层", "结构层", "神经敏化层"]
+  gold_concepts: ["术后腹腔粘连", "膈肌不对称", "viscerosomatic referral", "中枢敏化"]
+  gold_red_flag: false
+  notes: "三层叠加：内脏粘连(结构) + 呼吸代偿(控制) + 按压全身反应(神经敏化)"
+
+- id: case_07_breathing_pain
+  query: "膈肌疼了半年，深呼吸就刺痛，做了检查没问题，现在不敢用力呼吸"
+  gold_layers: ["控制层", "神经敏化层"]
+  gold_concepts: ["膈肌功能异常", "恐惧回避", "中枢敏化", "呼吸重训"]
+  gold_red_flag: false
+  notes: "膈肌问题 + 恐动症叠加"
+
+- id: case_08_posture_pain
+  query: "颈椎 MRI 显示轻微突出，但医生说不严重；现在一抬头就头晕，肩颈摸哪都疼"
+  gold_layers: ["结构层", "神经敏化层"]
+  gold_concepts: ["颈椎活动度", "中枢敏化", "广泛性触压痛"]
+  gold_red_flag: false
+  notes: "结构小问题 + 敏化主导：典型边界陷阱"
+
+# ─── 红旗症状（3 条）──────────────────────────────────────────────────
+- id: case_09_red_flag_cardiac
+  query: "左胸下方刺痛三天，按一下就放射到后背，喘不上气，爬楼梯加重"
+  gold_layers: ["神经敏化层"]
+  gold_concepts: ["心源性警示", "立即转介", "胸痛红旗"]
+  gold_red_flag: true
+  notes: "心源性警示——必须转介，不能当成肌骨"
+
+- id: case_10_red_flag_neuro
+  query: "腰痛一周，最近开始大小便失禁，会阴部麻木"
+  gold_layers: ["神经敏化层"]
+  gold_concepts: ["马尾综合征", "立即转介", "神经红旗"]
+  gold_red_flag: true
+  notes: "马尾综合征——急诊红旗"
+
+- id: case_11_red_flag_systemic
+  query: "肩痛两个月，夜间加重把我痛醒，最近还低烧、体重下降了五公斤"
+  gold_layers: ["结构层", "神经敏化层"]
+  gold_concepts: ["夜间痛", "全身症状", "肿瘤红旗", "立即转介"]
+  gold_red_flag: true
+  notes: "肿瘤/系统性疾病红旗：夜间痛 + 体重下降 + 发热"
+
+# ─── 边界陷阱（3 条）──────────────────────────────────────────────────
+- id: case_12_visceral_only
+  query: "剖腹产之后下腹疤痕周围的皮肤拉一下就疼，但腰背没事，呼吸也正常"
+  gold_layers: ["结构层"]
+  gold_concepts: ["术后腹腔粘连", "瘢痕组织限制", "腹壁筋膜"]
+  gold_red_flag: false
+  notes: "纯内脏筋膜，不涉及神经敏化（不是按一下全身反应）"
+
+- id: case_13_pure_breathing
+  query: "唱歌老师说我气息不稳，吸气时下肋不会向两边打开"
+  gold_layers: ["控制层"]
+  gold_concepts: ["膈肌侧向扩张", "肋廓位置", "呼吸模式"]
+  gold_red_flag: false
+  notes: "纯呼吸控制，不涉及结构限制或敏化"
+
+- id: case_14_pure_output
+  query: "教练说我硬拉时屁股翘得太快，腰先动；其他动作都没问题"
+  gold_layers: ["输出层"]
+  gold_concepts: ["髋主导模式", "臀肌激活", "腰椎代偿"]
+  gold_red_flag: false
+  notes: "纯动作模式问题，不是结构或控制问题"
+
+# ─── 中枢敏化扩展（1 条）──────────────────────────────────────────────
+- id: case_15_chronic_widespread
+  query: "全身关节都酸痛五年了，睡眠也差，做什么都没力气，但每个关节单独检查都没问题"
+  gold_layers: ["神经敏化层"]
+  gold_concepts: ["纤维肌痛", "中枢敏化", "睡眠障碍", "疼痛神经科学教育"]
+  gold_red_flag: false
+  notes: "纤维肌痛样表现：中枢敏化 + 睡眠 + 疲劳，所有关节单独阴性"

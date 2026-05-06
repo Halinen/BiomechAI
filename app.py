@@ -71,10 +71,8 @@ def chat(
         {"role": "assistant", "content": ""},
     ]
 
-    accumulated = ""
-    for chunk in agent.ask_stream(user_input, image_path, layer):
-        accumulated += chunk
-        history[-1]["content"] = accumulated
+    for answer in agent.ask_stream(user_input, image_path, layer):
+        history[-1]["content"] = answer
         yield history
 
     if image_path:
@@ -98,7 +96,7 @@ with gr.Blocks(title="AI 动作评估助手") as demo:
     # 🏃 AI 动作评估助手
     描述你的姿势问题或动作代偿，可选上传照片，系统会从专业知识库中检索相关内容并给出评估建议。
 
-    **知识库涵盖：** FMS/SFMA（动作筛查）· NASM CES（纠正训练）· PRI（呼吸/骨盆）· 红旗症状
+    **知识库涵盖：** FMS/SFMA · NASM CES · PRI · 内脏筋膜手法 · 疼痛神经科学 · 呼吸重训 · 红旗症状
     """)
 
     with gr.Row():
@@ -126,7 +124,7 @@ with gr.Blocks(title="AI 动作评估助手") as demo:
                 height=200,
             )
             layer_selector = gr.Dropdown(
-                choices=["自动判断", "控制层", "结构层", "输出层"],
+                choices=["自动判断", "控制层", "结构层", "输出层", "神经敏化层"],
                 value="自动判断",
                 label="评估方向",
                 info="选择后只检索对应知识域，不确定请选'自动判断'"
@@ -134,10 +132,11 @@ with gr.Blocks(title="AI 动作评估助手") as demo:
             clear_btn = gr.Button("🗑️ 清空对话", variant="secondary")
 
             gr.Markdown("""
-            **三层框架说明：**
-            - **控制层** → PRI：呼吸模式、骨盆感知
-            - **结构层** → FMS/SFMA：关节活动度、软组织
+            **四层框架说明：**
+            - **控制层** → PRI + 呼吸重训：呼吸模式、膈肌、骨盆感知
+            - **结构层** → FMS/SFMA + 内脏筋膜：关节活动度、术后粘连
             - **输出层** → NASM CES：肌肉失衡、代偿模式
+            - **神经敏化层** → 疼痛神经科学：中枢敏化、恐惧回避
             """)
 
     # ── 事件绑定 ────────────────────────────────────────────────────────────

@@ -22,10 +22,13 @@ EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 # 每个文件夹对应 Chroma 里的一个独立集合，检索时互不干扰
 # key = 知识库子文件夹名，value = Chroma 集合名（小写，不能有空格）
 COLLECTIONS = {
-    "FMS_SFMA":   "fms_sfma",    # 功能动作筛查 / SFMA
-    "NASM_CES":   "nasm_ces",    # 代偿模式 / 纠正练习
-    "PRI":        "pri",         # 呼吸 / 肋廓 / 骨盆不对称
-    "Red_Flags":  "red_flags",   # 红旗症状 / 转介标准
+    "FMS_SFMA":              "fms_sfma",              # 功能动作筛查 / SFMA
+    "NASM_CES":              "nasm_ces",              # 代偿模式 / 纠正练习
+    "PRI":                   "pri",                   # 呼吸 / 肋廓 / 骨盆不对称
+    "Red_Flags":             "red_flags",             # 红旗症状 / 转介标准
+    "Visceral_Fascia":       "visceral_fascia",       # 内脏筋膜 / 术后粘连 / 内脏手法
+    "Pain_Neuroscience":     "pain_neuroscience",     # 疼痛神经科学 / 中枢敏化 / PNE
+    "Breathing_Retraining":  "breathing_retraining",  # 呼吸重训 / DNS / 膈肌功能
 }
 
 # ── 文本分块参数 ──────────────────────────────────────────────────────────────
@@ -59,16 +62,21 @@ LAYER_DESCRIPTIONS = {
     "控制层": (
         "神经肌肉控制层 — 问题根源在运动模式的神经调控，"
         "例如：呼吸模式异常、骨盆位置感知缺失、肌肉激活顺序错误。"
-        "对应知识库：PRI（呼吸、骨盆不对称）"
+        "对应知识库：PRI（呼吸、骨盆不对称）、Breathing_Retraining（DNS/膈肌重训）"
     ),
     "结构层": (
         "关节/组织结构层 — 问题根源在关节活动度、软组织长度或骨性限制，"
-        "例如：髋关节活动受限、胸椎僵硬、足弓塌陷。"
-        "对应知识库：FMS/SFMA（动作筛查发现的受限模式）"
+        "例如：髋关节活动受限、胸椎僵硬、足弓塌陷、术后内脏粘连牵拉体壁。"
+        "对应知识库：FMS/SFMA（动作筛查发现的受限模式）、Visceral_Fascia（内脏筋膜粘连）"
     ),
     "输出层": (
         "动作输出层 — 问题表现为肌肉失衡和代偿动作，"
         "例如：上交叉综合征、髋屈肌过度激活、臀肌抑制。"
         "对应知识库：NASM CES（抑制/延展/激活/整合流程）"
+    ),
+    "神经敏化层": (
+        "疼痛神经科学层 — 问题根源在中枢敏化或外周痛觉过敏，"
+        "例如：按压触发全身反应、疼痛与组织损伤不成比例、恐惧回避行为。"
+        "对应知识库：Pain_Neuroscience（PNE/中枢敏化/神经动员）"
     ),
 }
