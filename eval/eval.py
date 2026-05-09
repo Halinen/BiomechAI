@@ -40,7 +40,7 @@ from openai import OpenAI
 from rich.console import Console
 from rich.table import Table
 
-from rag_system.assessment import AssessmentRouter, LAYER_TO_COLLECTIONS
+from rag_system.assessment import LAYER_TO_COLLECTIONS
 from rag_system.config import CLAUDE_MODEL, GROQ_BASE_URL, COLLECTIONS, TOP_K
 from rag_system.retriever import RetrievedChunk
 
@@ -65,6 +65,10 @@ class Trace:
     chunks: list[RetrievedChunk]                 # 所有命中层的 chunk 合并
     chunks_by_collection: dict[str, list[RetrievedChunk]]
     answer: str
+    # Critic agent trace（从 AssessmentAgent 拿）
+    critic_iterations: int = 1
+    critic_actions: list[str] = None              # type: ignore
+    critic_issues: list[list[str]] = None         # type: ignore
 
 
 @dataclass
@@ -95,16 +99,23 @@ def load_testset(path: Path) -> list[Case]:
 
 # ── 流水线执行 ──────────────────────────────────────────────────────────────
 
-def run_pipeline(case: Case, router: AssessmentRouter, llm: OpenAI) -> Trace:
+def run_pipeline(case: Case, agent) -> Trace:
     """
-    复用 router 的 classify + 多 collection 检索；
-    生成阶段直接调一次 LLM（不走 AssessmentAgent，因为 ask_stream 已经把 JSON 元数据剥离逻辑放在了流式收尾，
-    eval 里直接调 LLM 拿到完整文本更简单）。
+    跑完整流水线：路由 → 多 collection 检索 → AssessmentAgent.ask（含 critic loop）。
+
+    关键点：复用 AssessmentAgent.ask 直接拿到 critic trace（last_iterations / last_critic_actions 等），
+    这样 eval 评估的就是真实生产路径，不再单独拼 prompt。
     """
-    # 1. 路由
+    router = agent.router
+
+    # 重置 agent history（每条 case 独立评估）
+    agent.reset()
+
+    # 1. 路由（独立调一次，记录 predicted_layers；agent 内部还会再调一次，
+    #    可以接受这点冗余以保持 trace 完整）
     predicted_layers = router.classify(case.query)
 
-    # 2. 多 collection 检索
+    # 2. 收集 chunks（用于 score_retrieval；agent 内部也会查，但我们要拿到 chunks 列表）
     all_chunks: list[RetrievedChunk] = []
     chunks_by_collection: dict[str, list[RetrievedChunk]] = {}
     for layer in predicted_layers:
@@ -112,34 +123,12 @@ def run_pipeline(case: Case, router: AssessmentRouter, llm: OpenAI) -> Trace:
             chunks = router._retriever.query(case.query, cname, TOP_K)
             chunks_by_collection[cname] = chunks
             all_chunks.extend(chunks)
-    # 红旗 collection 永远查
     rf_chunks = router._retriever.query(case.query, COLLECTIONS["Red_Flags"], 3)
     chunks_by_collection[COLLECTIONS["Red_Flags"]] = rf_chunks
     all_chunks.extend(rf_chunks)
 
-    # 3. 生成回答（简化：直接拼 prompt，不走 AssessmentAgent.ask 的 history 逻辑）
-    context_parts = []
-    for chunk in all_chunks[:15]:
-        context_parts.append(f"[{chunk.folder}/{chunk.source_file}]\n{chunk.text}")
-    context = "\n\n---\n\n".join(context_parts)[:3500]
-
-    gen_prompt = f"""你是动作评估顾问。基于下面的参考资料，用中文给出针对用户问题的评估和建议。
-如果发现红旗症状（急性、神经压迫、系统性疾病、心源性等），必须明确建议立即就医。
-
-参考资料：
-{context}
-
-用户问题：{case.query}
-
-直接给出回答，不要重复用户问题。"""
-
-    response = llm.chat.completions.create(
-        model=CLAUDE_MODEL,
-        max_tokens=1500,
-        temperature=0.3,
-        messages=[{"role": "user", "content": gen_prompt}],
-    )
-    answer = response.choices[0].message.content or ""
+    # 3. 通过 AssessmentAgent.ask 走完整 critic loop
+    answer = agent.ask(case.query)
 
     return Trace(
         case=case,
@@ -147,6 +136,9 @@ def run_pipeline(case: Case, router: AssessmentRouter, llm: OpenAI) -> Trace:
         chunks=all_chunks,
         chunks_by_collection=chunks_by_collection,
         answer=answer,
+        critic_iterations=agent.last_iterations,
+        critic_actions=list(agent.last_critic_actions),
+        critic_issues=list(agent.last_critic_issues),
     )
 
 
@@ -243,12 +235,14 @@ AI 回答：
     return llm_judge_json(llm, prompt, max_tokens=600)
 
 
-def evaluate_case(case: Case, router: AssessmentRouter, llm: OpenAI, console: Console) -> tuple[CaseScore, Trace]:
+def evaluate_case(case: Case, agent, llm: OpenAI, console: Console) -> tuple[CaseScore, Trace]:
     console.print(f"\n[bold cyan]▶ {case.id}[/bold cyan] {case.query[:50]}...")
 
-    trace = run_pipeline(case, router, llm)
+    trace = run_pipeline(case, agent)
     console.print(f"  路由命中：{trace.predicted_layers}（gold: {case.gold_layers}）")
     console.print(f"  检索 chunk 数：{len(trace.chunks)}")
+    if trace.critic_actions and trace.critic_actions[0] != "disabled":
+        console.print(f"  Critic: {trace.critic_iterations} 轮，actions={trace.critic_actions}")
 
     # 路由
     strict, jaccard = score_routing(trace)
@@ -364,9 +358,33 @@ def write_markdown_report(scores: list[CaseScore], traces: list[Trace], path: Pa
         f"| 红旗处置正确率 | {rf_correct}/{len(rf_cases)} |",
         f"| 生成总分 | {avg_overall:.1f}/5 |",
         "",
+    ]
+
+    # Critic 反思统计（只在启用时有意义）
+    critic_traces = [t for t in traces if t.critic_actions and t.critic_actions[0] != "disabled"]
+    if critic_traces:
+        avg_iter = sum(t.critic_iterations for t in critic_traces) / len(critic_traces)
+        triggered = [t for t in critic_traces if t.critic_iterations > 1]
+        from collections import Counter
+        action_counts: Counter = Counter()
+        for t in critic_traces:
+            for a in t.critic_actions:
+                if a not in ("ok", "disabled", "max_iter_fallback"):
+                    action_counts[a] += 1
+        lines.extend([
+            "## Critic 反思统计",
+            "",
+            f"- 启用 critic 的 case 数: **{len(critic_traces)}**",
+            f"- 平均迭代轮数: **{avg_iter:.2f}**（1 = 一次过，>1 = 反思过）",
+            f"- 触发反思的 case: **{len(triggered)}/{len(critic_traces)}**",
+            f"- 修正动作分布: {dict(action_counts)}",
+            "",
+        ])
+
+    lines.extend([
         "## 失败模式分类",
         "",
-    ]
+    ])
 
     # 区分两类失败
     routing_ok_retrieval_bad = [s for s in scores if s.layer_strict and s.concept_recall < 0.5]
@@ -420,6 +438,14 @@ def write_markdown_report(scores: list[CaseScore], traces: list[Trace], path: Pa
             f"- 红旗处置：{rf_label} (期望 {case.gold_red_flag})",
             f"- 生成总分：{score.gen_overall:.1f}/5",
             f"- Judge 评语：{score.gen_reason}",
+        ])
+        if trace.critic_actions and trace.critic_actions[0] != "disabled":
+            lines.append(f"- Critic: {trace.critic_iterations} 轮，actions={trace.critic_actions}")
+            if trace.critic_issues:
+                for i, issues in enumerate(trace.critic_issues, 1):
+                    if issues:
+                        lines.append(f"  - 第 {i} 轮发现: {issues}")
+        lines.extend([
             "",
             "<details><summary>AI 回答全文</summary>",
             "",
@@ -452,6 +478,8 @@ def main():
     parser.add_argument("--out", default="eval/eval_results.md")
     parser.add_argument("--sample", type=int, default=None,
                         help="只跑前 N 条用例（调试用）")
+    parser.add_argument("--no-critic", action="store_true",
+                        help="禁用 Critic agent 反思环（用于和有 critic 的版本做对比）")
     args = parser.parse_args()
 
     console = Console()
@@ -467,7 +495,10 @@ def main():
     console.print(f"[green]加载 {len(cases)} 条用例[/green]")
 
     # 2. 初始化
-    router = AssessmentRouter()
+    from rag_system.agent import AssessmentAgent
+    enable_critic = not args.no_critic
+    console.print(f"[dim]Critic agent: {'enabled' if enable_critic else 'DISABLED'}[/dim]")
+    agent = AssessmentAgent(enable_critic=enable_critic)
     llm = OpenAI(
         api_key=__import__("os").environ.get("GROQ_API_KEY"),
         base_url=GROQ_BASE_URL,
@@ -479,7 +510,7 @@ def main():
     t0 = time.time()
     for case in cases:
         try:
-            score, trace = evaluate_case(case, router, llm, console)
+            score, trace = evaluate_case(case, agent, llm, console)
             scores.append(score)
             traces.append(trace)
         except Exception as e:

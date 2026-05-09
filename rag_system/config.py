@@ -45,11 +45,20 @@ CHUNK_OVERLAP = 80
 TOP_K = 5
 
 # ── 相似度过滤阈值（余弦距离，越小越相似）────────────────────────────────────
-# 低于此值：直接保留（高置信度）
-SIMILARITY_ACCEPT = 0.35
-# 高于此值：直接丢弃（低置信度）
-SIMILARITY_REJECT = 0.60
+# 这套阈值是按"中文 query 翻译成英文后"在各 collection 的实测距离分布调的：
+#   pain_neuroscience: 0.44-0.47（全部命中）
+#   pri:               0.45-0.50（全部命中）
+#   nasm_ces:          0.48-0.57（前 5 命中）
+#   fms_sfma:          0.54-0.65（边界稍高）
+# 设 ACCEPT=0.60 让 70%+ 的 chunk 直接保留，跳过 LLM judge；
+# REJECT=0.70 兜底丢明显不相关的；中间区域才用 judge 兜底。
+# 之前 0.35/0.60 对翻译后的 query 等于 100% 走 judge，单 query 30+ 次 LLM 调用，token 烧爆。
+SIMILARITY_ACCEPT = 0.60  # 低于此值：直接保留（高置信度）
+SIMILARITY_REJECT = 0.70  # 高于此值：直接丢弃（低置信度）
 # 介于两者之间：交给 LLM 判断（边界情况）
+
+# Critic agent 自我反思最大迭代轮数（生成→质检→不合格则重生成；超出仍不通过则兜底输出）
+MAX_CRITIC_ITERATIONS = 2
 
 # ── LLM 模型 ─────────────────────────────────────────────────────────────────
 # Groq 免费模型，速度极快

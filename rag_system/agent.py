@@ -18,8 +18,9 @@ from pathlib import Path
 
 from openai import OpenAI
 
-from rag_system.config import CLAUDE_MODEL, GROQ_BASE_URL, LAYER_DESCRIPTIONS
+from rag_system.config import CLAUDE_MODEL, GROQ_BASE_URL, LAYER_DESCRIPTIONS, MAX_CRITIC_ITERATIONS
 from rag_system.assessment import AssessmentRouter, AssessmentContext, build_rag_prompt_section
+from rag_system.critic import Critic
 
 
 # ── 系统提示词 ──────────────────────────────────────────────────────────────
@@ -228,17 +229,153 @@ class AssessmentAgent:
       这里用 self.history 列表维护，每轮对话追加一条 user + 一条 assistant。
     """
 
-    def __init__(self):
+    def __init__(self, enable_critic: bool = True):
         self.client = OpenAI(
             api_key=__import__("os").environ.get("GROQ_API_KEY"),
             base_url=GROQ_BASE_URL,
         )
         self.router = AssessmentRouter()
+        self.critic = Critic(self.client) if enable_critic else None
         self.history: list[dict] = []  # 对话历史
+
+        # 最近一次 ask 的 critic trace（供 eval / 调试观察反思过程）
+        self.last_iterations: int = 0
+        self.last_critic_actions: list[str] = []
+        self.last_critic_issues: list[list[str]] = []
 
     def reset(self):
         """清空对话历史（开始新的评估会话）。"""
         self.history = []
+
+    def _generate_once(
+        self,
+        query: str,
+        ctx: AssessmentContext,
+        image_path: str | Path | None,
+        extra_constraints: list[str],
+        stream: bool,
+    ) -> str:
+        """
+        单次生成调用。被 critic loop 反复调用。
+
+        extra_constraints: critic 决定的额外 prompt 约束。例如:
+          - "严格只引用上方参考片段中出现的事实，不要引入外部知识"
+          - "用户描述涉及红旗症状（夜间痛/马尾/心源性等），必须在回答开头明确建议立即就医"
+        """
+        user_msg = build_user_message(query, ctx, image_path)
+
+        # 把约束追加到 user message 文本部分
+        if extra_constraints:
+            constraint_block = "\n\n[Critic 修正要求]\n" + "\n".join(f"- {c}" for c in extra_constraints)
+            if isinstance(user_msg["content"], str):
+                user_msg["content"] = user_msg["content"] + constraint_block
+            else:
+                # 多模态消息：找 text 块追加
+                for part in user_msg["content"]:
+                    if part.get("type") == "text":
+                        part["text"] = part["text"] + constraint_block
+                        break
+
+        messages = self.history + [user_msg]
+
+        if stream:
+            full_answer = ""
+            stream_resp = self.client.chat.completions.create(
+                model=CLAUDE_MODEL,
+                max_tokens=8000,
+                messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages,
+                stream=True,
+            )
+            for chunk in stream_resp:
+                text_chunk = chunk.choices[0].delta.content or ""
+                full_answer += text_chunk
+            return _strip_metadata_line(full_answer)
+        else:
+            response = self.client.chat.completions.create(
+                model=CLAUDE_MODEL,
+                max_tokens=8000,
+                messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages,
+            )
+            return _strip_metadata_line(response.choices[0].message.content or "")
+
+    def _run_critic_loop(
+        self,
+        query: str,
+        layer: str | None,
+        image_path: str | Path | None,
+        stream: bool,
+    ) -> str:
+        """
+        Agent 的核心：生成→质检→不合格则修正再生成的反思环。
+
+        每轮的可能动作:
+          - ok: 通过，输出当前 draft
+          - retrieve_more: critic 给出改写 query，重新检索后再生成
+          - remove_hallucination: 在 prompt 加严格 grounding 约束，重生成
+          - add_red_flag: 在 prompt 强制要求加转介提示，重生成
+        """
+        # 初始检索
+        ctx = (self.router.route_targeted(query, layer) if layer
+               else self.router.route(query))
+
+        constraints: list[str] = []
+        self.last_iterations = 0
+        self.last_critic_actions = []
+        self.last_critic_issues = []
+
+        draft = ""
+
+        for iteration in range(MAX_CRITIC_ITERATIONS + 1):  # 最多 MAX 次反思 = MAX+1 次生成
+            self.last_iterations = iteration + 1
+
+            # 生成
+            draft = self._generate_once(query, ctx, image_path, constraints, stream)
+
+            # 没启用 critic 直接返回
+            if self.critic is None:
+                self.last_critic_actions.append("disabled")
+                return draft
+
+            # 最后一轮兜底：不再质检，直接返回
+            if iteration == MAX_CRITIC_ITERATIONS:
+                self.last_critic_actions.append("max_iter_fallback")
+                return draft
+
+            # 质检
+            # 把多个 collection 的 chunks 合并为单 list，传给 critic
+            flat_chunks = []
+            for chunks in ctx.all_chunks.values():
+                flat_chunks.extend(chunks)
+            critique = self.critic.review(query, flat_chunks, draft)
+            self.last_critic_actions.append(critique.action)
+            self.last_critic_issues.append(critique.issues)
+
+            print(f"[Agent] Critic 第 {iteration+1} 轮: pass={critique.pass_check}, "
+                  f"action={critique.action}, issues={critique.issues}")
+
+            if critique.pass_check:
+                return draft
+
+            # 不合格——按 action 调整下一轮
+            if critique.action == "retrieve_more" and critique.suggested_query:
+                # critic 给了改写 query，用它重新检索（用 layer 路由保持一致）
+                ctx = (self.router.route_targeted(critique.suggested_query, layer) if layer
+                       else self.router.route(critique.suggested_query))
+            elif critique.action == "remove_hallucination":
+                constraints.append(
+                    "严格只引用上方参考片段中明确出现的概念和断言；不要引入参考片段没说的具体建议；"
+                    f"上一版有以下问题需修正：{'；'.join(critique.issues)}"
+                )
+            elif critique.action == "add_red_flag":
+                constraints.append(
+                    "用户描述涉及红旗症状，必须在回答开头明确建议立即就医并说明原因；"
+                    f"具体红旗信号：{'；'.join(critique.issues)}"
+                )
+            # action="ok" 但 pass_check=false 不太合理；按通过处理避免死循环
+            else:
+                return draft
+
+        return draft
 
     def ask(
         self,
@@ -249,38 +386,13 @@ class AssessmentAgent:
         """
         发送一条消息，返回完整回答（非流式）。
 
-        参数：
-          query      — 用户问题
-          image_path — 可选图片路径（姿势照片、动作截图等）
-          layer      — 可选指定层（"控制层"/"结构层"/"输出层"）；
-                       不传则三层都查
-
-        返回：
-          str — Claude 的回答文本
+        走 Critic agent loop：生成 → 质检 → 不合格则修正再生成（最多 MAX_CRITIC_ITERATIONS+1 轮）。
+        反思过程的元数据存在 self.last_iterations / self.last_critic_actions / self.last_critic_issues，
+        供 eval 或调试观察。
         """
-        # 1. RAG 检索
-        if layer:
-            ctx = self.router.route_targeted(query, layer)
-        else:
-            ctx = self.router.route(query)
+        answer = self._run_critic_loop(query, layer, image_path, stream=False)
 
-        # 2. 构建当前轮消息
-        user_msg = build_user_message(query, ctx, image_path)
-
-        # 3. 把历史 + 当前消息发给 Claude
-        messages = self.history + [user_msg]
-
-        response = self.client.chat.completions.create(
-            model=CLAUDE_MODEL,
-            max_tokens=8000,
-            messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages,
-        )
-
-        # 4. 提取文字回答
-        answer = response.choices[0].message.content or "（未能生成回答）"
-
-        # 5. 更新对话历史（保存用户问题和 Claude 回答）
-        # 注意：history 里的 user 消息去掉 RAG 上下文，只保留用户原话，节省 token
+        # 更新对话历史
         self.history.append({"role": "user", "content": query})
         self.history.append({"role": "assistant", "content": answer})
 
@@ -293,42 +405,27 @@ class AssessmentAgent:
         layer: str | None = None,
     ):
         """
-        发送一条消息，以生成器方式流式返回回答。
+        发送一条消息，以生成器方式输出。
 
-        用法（在 app.py 里）：
-          for chunk in agent.ask_stream(query, image_path):
-              accumulated += chunk
-              yield accumulated  # Gradio 的 gr.update 方式
-
-        参数/返回：
-          同 ask()，但改为 yield 逐段文字
+        注意：因为 critic 需要看完整 draft 才能审查，这里不做"打字机式"流式，
+        而是在反思过程中 yield 进度提示（如"思考中... [Critic 反思: 检索不足]"），
+        最后 yield 最终 draft 全文。Gradio chat 接收方应直接覆盖 message。
         """
-        # RAG 检索
-        if layer:
-            ctx = self.router.route_targeted(query, layer)
-        else:
-            ctx = self.router.route(query)
+        # 进度通知：critic loop 内部会通过 print 输出
+        # 这里用一个简化版：直接调 _run_critic_loop 拿最终结果
+        # （未来可改成生成器模式逐轮 yield 中间状态，但当前 UI 只展示最终 answer）
+        answer = self._run_critic_loop(query, layer, image_path, stream=True)
 
-        user_msg = build_user_message(query, ctx, image_path)
-        messages = self.history + [user_msg]
+        # 反思摘要附在末尾（仅当真的反思过且非 disabled 时）
+        if (self.last_iterations > 1
+                and self.last_critic_actions
+                and self.last_critic_actions[0] != "disabled"):
+            actions = " → ".join(self.last_critic_actions)
+            answer = answer + f"\n\n---\n*[Critic 反思 {self.last_iterations} 轮: {actions}]*"
 
-        # 流式调用——先收完全文再处理，避免 JSON 元数据暴露给用户
-        full_answer = ""
-        stream = self.client.chat.completions.create(
-            model=CLAUDE_MODEL,
-            max_tokens=8000,
-            messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages,
-            stream=True,
-        )
-        for chunk in stream:
-            text_chunk = chunk.choices[0].delta.content or ""
-            full_answer += text_chunk
+        yield answer
 
-        # 把末尾的 JSON 元数据行剥离，只向用户展示正文
-        answer_text = _strip_metadata_line(full_answer)
-
-        yield answer_text
-
-        # 更新对话历史（存正文，不存元数据）
+        # 更新对话历史（去掉反思 footer）
+        clean_answer = answer.split("\n\n---\n*[Critic")[0].rstrip()
         self.history.append({"role": "user", "content": query})
-        self.history.append({"role": "assistant", "content": answer_text})
+        self.history.append({"role": "assistant", "content": clean_answer})
