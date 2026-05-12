@@ -43,6 +43,7 @@ from rich.table import Table
 from rag_system.assessment import LAYER_TO_COLLECTIONS
 from rag_system.config import CLAUDE_MODEL, GROQ_BASE_URL, COLLECTIONS, TOP_K
 from rag_system.retriever import RetrievedChunk
+from rag_system.trace import start_trace
 
 
 # ── 数据结构 ────────────────────────────────────────────────────────────────
@@ -105,7 +106,15 @@ def run_pipeline(case: Case, agent) -> Trace:
 
     关键点：复用 AssessmentAgent.ask 直接拿到 critic trace（last_iterations / last_critic_actions 等），
     这样 eval 评估的就是真实生产路径，不再单独拼 prompt。
+
+    Trace 包裹：设置环境变量 RAG_TRACE_DIR=eval/traces/ 即启用 JSONL trace，
+    每条 case 一个文件，含所有 LLM 调用的 prompt/response/component。
     """
+    with start_trace(case.query, metadata={"case_id": case.id}):
+        return _run_pipeline_inner(case, agent)
+
+
+def _run_pipeline_inner(case: Case, agent) -> Trace:
     router = agent.router
 
     # 重置 agent history（每条 case 独立评估）
@@ -174,27 +183,43 @@ def score_routing(trace: Trace) -> tuple[bool, float]:
 
 def score_retrieval(trace: Trace, llm: OpenAI) -> tuple[float, dict[str, bool]]:
     """
-    对每个 gold_concept，扫描 trace.chunks 看是否有任何一个 chunk 覆盖它。
-    覆盖判定走 LLM judge。命中即停（recall 而非 precision）。
+    批量版：一次 LLM 调用同时判断「每个 gold_concept 是否被任一 chunk 实质性承载」。
+
+    旧 N×M 版（嵌套循环每 chunk × 每 concept 各调一次 judge）总开销 150-300 次 LLM 调用 / eval，
+    免费档配额直接爆。批量版砍到 15 次（每 case 1 次），快 10 倍，省 80% token。
+
+    Trade-off：LLM 在长 context 多目标判断会有轻微准确率损失（漏看 chunk 或编号混淆）。
+    eval 是观察 trend 的工具，不需要 100% 精确。
     """
-    hits: dict[str, bool] = {}
-    for concept in trace.case.gold_concepts:
-        covered = False
-        for chunk in trace.chunks[:15]:
-            prompt = f"""判断下面文献片段是否实质性承载指定知识点。
+    chunks = trace.chunks[:15]
+    if not chunks or not trace.case.gold_concepts:
+        return 0.0, {c: False for c in trace.case.gold_concepts}
 
-知识点：{concept}
+    chunks_text = "\n\n".join(
+        f"[chunk_{i}] ({c.folder}) {c.text[:400]}"
+        for i, c in enumerate(chunks)
+    )
+    concepts_list = "\n".join(f"- {c}" for c in trace.case.gold_concepts)
 
-片段：{chunk.text[:600]}
+    prompt = f"""判断下面每个知识点是否被任一片段实质性承载。
 
-返回 JSON：{{"covers": true/false, "reason": "<30字内>"}}
-仅出现关键词但语义无关算 false。"""
-            result = llm_judge_json(llm, prompt, max_tokens=120)
-            if result.get("covers") is True:
-                covered = True
-                break
-        hits[concept] = covered
+知识点列表：
+{concepts_list}
 
+文献片段（编号 chunk_0 到 chunk_{len(chunks)-1}）：
+{chunks_text}
+
+对每个知识点，返回一个布尔值（true=任一片段实质性承载该知识点，false=没有任何片段实质讨论它）。
+仅出现关键词但语义无关算 false。
+
+返回严格 JSON（key 必须和知识点列表一一对应）：
+{{
+  "coverage": {{"<知识点1>": true/false, "<知识点2>": true/false, ...}}
+}}"""
+
+    result = llm_judge_json(llm, prompt, max_tokens=400)
+    cov = result.get("coverage", {})
+    hits = {c: bool(cov.get(c, False)) for c in trace.case.gold_concepts}
     recall = sum(hits.values()) / len(hits) if hits else 0.0
     return recall, hits
 

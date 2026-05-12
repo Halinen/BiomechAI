@@ -20,10 +20,12 @@ import chromadb
 from openai import OpenAI
 from sentence_transformers import SentenceTransformer
 
+from rag_system.trace import log_llm_call
 from rag_system.config import (
     CHROMA_PATH,
     CLAUDE_MODEL,
     EMBEDDING_MODEL,
+    ENABLE_LLM_JUDGE,
     GROQ_BASE_URL,
     SIMILARITY_ACCEPT,
     SIMILARITY_REJECT,
@@ -114,6 +116,7 @@ class Retriever:
                 messages=[{"role": "user", "content": prompt}],
             )
             translation = (response.choices[0].message.content or "").strip()
+            log_llm_call("retriever.translate", prompt, translation, CLAUDE_MODEL)
             # 去掉模型偶尔加的引号
             if translation.startswith(('"', "'")) and translation.endswith(('"', "'")):
                 translation = translation[1:-1].strip()
@@ -148,6 +151,11 @@ class Retriever:
             messages=[{"role": "user", "content": prompt}],
         )
         answer = (response.choices[0].message.content or "").strip().lower()
+        log_llm_call(
+            "retriever.judge", prompt, answer, CLAUDE_MODEL,
+            extra={"chunk_source": chunk.source_file, "chunk_score": chunk.score,
+                   "kept": answer.startswith("y")},
+        )
         return answer.startswith("y")
 
     def query(
@@ -190,7 +198,8 @@ class Retriever:
         # 多取一些候选，给过滤留余量
         results = collection.query(
             query_embeddings=[query_vector],
-            n_results=min(top_k * 3, collection.count()),
+            # 多取候选给过滤留余量；top_k*2 而非 *3 减少进入 judge 的边界 chunk
+            n_results=min(top_k * 2, collection.count()),
             include=["documents", "metadatas", "distances"],
         )
 
@@ -212,9 +221,13 @@ class Retriever:
                 # 高置信度：直接保留
                 kept.append(chunk)
             elif dist < SIMILARITY_REJECT:
-                # 边界情况：交给 LLM 判断（用翻译后的英文 query，与 chunk 同语言）
-                print(f"[Retriever] LLM 判断边界 chunk (score={dist:.3f}): {chunk.source_file}")
-                if self._llm_judge(search_text, chunk):
+                # 边界情况：是否调 LLM judge 取决于 config
+                if ENABLE_LLM_JUDGE:
+                    print(f"[Retriever] LLM 判断边界 chunk (score={dist:.3f}): {chunk.source_file}")
+                    if self._llm_judge(search_text, chunk):
+                        kept.append(chunk)
+                else:
+                    # judge 关闭：信任向量距离，边界 chunk 直接保留
                     kept.append(chunk)
             # else: score >= SIMILARITY_REJECT，直接丢弃
 

@@ -18,6 +18,7 @@ from openai import OpenAI
 
 from rag_system.config import CLAUDE_MODEL
 from rag_system.retriever import RetrievedChunk
+from rag_system.trace import log_llm_call
 
 
 # ── 数据结构 ────────────────────────────────────────────────────────────────
@@ -105,8 +106,18 @@ action 选择规则：
             )
             raw = resp.choices[0].message.content or "{}"
             data = json.loads(raw)
+            log_llm_call(
+                "critic.review", prompt, raw, CLAUDE_MODEL,
+                extra={"pass": bool(data.get("pass", True)),
+                       "action": str(data.get("action", "ok")),
+                       "issues": data.get("issues", [])},
+            )
         except Exception as e:
             print(f"[Critic] 调用失败，默认通过：{e}")
+            log_llm_call(
+                "critic.review", prompt, f"ERROR: {e}", CLAUDE_MODEL,
+                extra={"fallback": True},
+            )
             return CritiqueResult(
                 pass_check=True,
                 issues=[],

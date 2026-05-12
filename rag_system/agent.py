@@ -21,6 +21,7 @@ from openai import OpenAI
 from rag_system.config import CLAUDE_MODEL, GROQ_BASE_URL, LAYER_DESCRIPTIONS, MAX_CRITIC_ITERATIONS
 from rag_system.assessment import AssessmentRouter, AssessmentContext, build_rag_prompt_section
 from rag_system.critic import Critic
+from rag_system.trace import log_llm_call
 
 
 # ── 系统提示词 ──────────────────────────────────────────────────────────────
@@ -289,14 +290,24 @@ class AssessmentAgent:
             for chunk in stream_resp:
                 text_chunk = chunk.choices[0].delta.content or ""
                 full_answer += text_chunk
-            return _strip_metadata_line(full_answer)
+            answer = _strip_metadata_line(full_answer)
+            log_llm_call(
+                "agent.generate", messages, answer, CLAUDE_MODEL,
+                extra={"streaming": True, "has_constraints": bool(extra_constraints)},
+            )
+            return answer
         else:
             response = self.client.chat.completions.create(
                 model=CLAUDE_MODEL,
                 max_tokens=8000,
                 messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages,
             )
-            return _strip_metadata_line(response.choices[0].message.content or "")
+            answer = _strip_metadata_line(response.choices[0].message.content or "")
+            log_llm_call(
+                "agent.generate", messages, answer, CLAUDE_MODEL,
+                extra={"streaming": False, "has_constraints": bool(extra_constraints)},
+            )
+            return answer
 
     def _run_critic_loop(
         self,
